@@ -1,0 +1,15 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "go_default_library",
+    srcs = [
+        "consts.go",
+        "doc.go",
+    ],
+    importpath = "sigs.k8s.io/cloud-provider-azure/pkg/consts",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//vendor/github.com/Azure/azure-sdk-for-go/services/storage/mgmt/2019-06-01/storage:go_default_library",
+        "//vendor/k8s.io/component-base/featuregate:go_default_library",
+    ],
+)

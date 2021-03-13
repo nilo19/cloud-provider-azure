@@ -23,6 +23,7 @@ go_test(
     srcs = ["azure_armclient_test.go"],
     embed = [":go_default_library"],
     deps = [
+        "//pkg/consts:go_default_library",
         "//pkg/retry:go_default_library",
         "//vendor/github.com/Azure/go-autorest/autorest:go_default_library",
         "//vendor/github.com/stretchr/testify/assert:go_default_library",

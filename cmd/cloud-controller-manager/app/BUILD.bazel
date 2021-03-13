@@ -11,6 +11,10 @@ go_library(
     deps = [
         "//cmd/cloud-controller-manager/app/config:go_default_library",
         "//cmd/cloud-controller-manager/app/options:go_default_library",
+        "//pkg/consts:go_default_library",
+        "//pkg/nodeipam:go_default_library",
+        "//pkg/nodeipam/config:go_default_library",
+        "//pkg/nodeipam/ipam:go_default_library",
         "//pkg/version:go_default_library",
         "//pkg/version/verflag:go_default_library",
         "//vendor/github.com/spf13/cobra:go_default_library",
