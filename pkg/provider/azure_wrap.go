@@ -24,7 +24,7 @@ import (
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2021-12-01/compute"
-	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2021-08-01/network"
+	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2022-01-01/network"
 	"github.com/Azure/go-autorest/autorest/to"
 
 	"k8s.io/apimachinery/pkg/types"
@@ -420,20 +420,21 @@ func ConvertResourceGroupNameToLower(resourceID string) (string, error) {
 // Since both public and internal LBs are supported, lbName and lbName-internal are treated as same.
 // If not same, the lbName for existingBackendPools would also be returned.
 func isBackendPoolOnSameLB(newBackendPoolID string, existingBackendPools []string) (bool, string, error) {
-	matches := backendPoolIDRE.FindStringSubmatch(newBackendPoolID)
-	if len(matches) != 2 {
-		return false, "", fmt.Errorf("new backendPoolID %q is in wrong format", newBackendPoolID)
+	newLBName, err := getLBNameFromBackendPoolID(newBackendPoolID)
+	if err != nil {
+		return false, "", err
 	}
-
-	newLBName := matches[1]
 	newLBNameTrimmed := strings.TrimSuffix(newLBName, consts.InternalLoadBalancerNameSuffix)
 	for _, backendPool := range existingBackendPools {
 		matches := backendPoolIDRE.FindStringSubmatch(backendPool)
-		if len(matches) != 2 {
+		if len(matches) != 3 {
 			return false, "", fmt.Errorf("existing backendPoolID %q is in wrong format", backendPool)
 		}
 
-		lbName := matches[1]
+		lbName, err := getLBNameFromBackendPoolID(backendPool)
+		if err != nil {
+			return false, "", err
+		}
 		if !strings.EqualFold(strings.TrimSuffix(lbName, consts.InternalLoadBalancerNameSuffix), newLBNameTrimmed) {
 			return false, lbName, nil
 		}

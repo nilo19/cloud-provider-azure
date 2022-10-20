@@ -22,7 +22,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2021-08-01/network"
+	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2022-01-01/network"
 	"github.com/Azure/go-autorest/autorest"
 	"github.com/Azure/go-autorest/autorest/azure"
 	"github.com/Azure/go-autorest/autorest/to"
@@ -53,6 +53,10 @@ type Client struct {
 	// ARM throttling configures.
 	RetryAfterReader time.Time
 	RetryAfterWriter time.Time
+}
+
+type backendPoolsToBeMigrated struct {
+	BackendPoolNames []string `json:"pools"`
 }
 
 // New creates a new LoadBalancer client with ratelimiting.
@@ -482,6 +486,59 @@ func (c *Client) createOrUpdateLBBackendPool(ctx context.Context, resourceGroupN
 		}
 	}
 
+	return nil
+}
+
+// MigrateToIPBasedBackendPool migrates a NIC-based backend pool to IP-based.
+func (c *Client) MigrateToIPBasedBackendPool(ctx context.Context, resourceGroupName string, loadBalancerName string, backendPoolName string) *retry.Error {
+	mc := metrics.NewMetricContext("load_balancers", "migrate_to_ip_based_backend_pool", resourceGroupName, c.subscriptionID, "")
+
+	// Report errors if the client is rate limited.
+	if !c.rateLimiterWriter.TryAccept() {
+		mc.RateLimitedCount()
+		return retry.GetRateLimitError(true, "LBMigrateToIPBasedBackendPool")
+	}
+
+	// Report errors if the client is throttled.
+	if c.RetryAfterWriter.After(time.Now()) {
+		mc.ThrottledCount()
+		rerr := retry.GetThrottlingError("LBMigrateToIPBasedBackendPool", "client throttled", c.RetryAfterWriter)
+		return rerr
+	}
+
+	parameters := backendPoolsToBeMigrated{
+		BackendPoolNames: []string{backendPoolName},
+	}
+	rerr := c.migrateToIPBasedBackendPool(ctx, resourceGroupName, loadBalancerName, parameters)
+	mc.Observe(rerr)
+	if rerr != nil {
+		if rerr.IsThrottled() {
+			// Update RetryAfterReader so that no more requests would be sent until RetryAfter expires.
+			c.RetryAfterWriter = rerr.RetryAfter
+		}
+
+		return rerr
+	}
+
+	return nil
+}
+
+func (c *Client) migrateToIPBasedBackendPool(ctx context.Context, resourceGroupName string, loadBalancerName string, parameters backendPoolsToBeMigrated) *retry.Error {
+	resourceID := armclient.GetResourceID(
+		c.subscriptionID,
+		resourceGroupName,
+		lbResourceType,
+		loadBalancerName,
+	)
+
+	response, rerr := c.armClient.PostResource(ctx, resourceID, "migrateToIpBased", parameters, map[string]interface{}{})
+	defer c.armClient.CloseResponse(ctx, response)
+	if rerr != nil {
+		klog.V(5).Infof("Received error in %s: resourceID: %s, error: %s", "loadbalancerbackendpool.migrate.request", resourceID, rerr.Error())
+		return rerr
+	}
+
+	klog.Infof("Response: %v", response)
 	return nil
 }
 

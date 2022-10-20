@@ -25,7 +25,7 @@ import (
 	context "context"
 	reflect "reflect"
 
-	network "github.com/Azure/azure-sdk-for-go/services/network/mgmt/2021-08-01/network"
+	network "github.com/Azure/azure-sdk-for-go/services/network/mgmt/2022-01-01/network"
 	gomock "github.com/golang/mock/gomock"
 	retry "sigs.k8s.io/cloud-provider-azure/pkg/retry"
 )
@@ -137,4 +137,18 @@ func (m *MockInterface) List(ctx context.Context, resourceGroupName string) ([]n
 func (mr *MockInterfaceMockRecorder) List(ctx, resourceGroupName interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "List", reflect.TypeOf((*MockInterface)(nil).List), ctx, resourceGroupName)
+}
+
+// MigrateToIPBasedBackendPool mocks base method.
+func (m *MockInterface) MigrateToIPBasedBackendPool(ctx context.Context, resourceGroupName, loadBalancerName, backendPoolName string) *retry.Error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "MigrateToIPBasedBackendPool", ctx, resourceGroupName, loadBalancerName, backendPoolName)
+	ret0, _ := ret[0].(*retry.Error)
+	return ret0
+}
+
+// MigrateToIPBasedBackendPool indicates an expected call of MigrateToIPBasedBackendPool.
+func (mr *MockInterfaceMockRecorder) MigrateToIPBasedBackendPool(ctx, resourceGroupName, loadBalancerName, backendPoolName interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "MigrateToIPBasedBackendPool", reflect.TypeOf((*MockInterface)(nil).MigrateToIPBasedBackendPool), ctx, resourceGroupName, loadBalancerName, backendPoolName)
 }

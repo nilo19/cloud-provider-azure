@@ -25,7 +25,7 @@ import (
 	"sync"
 
 	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2021-12-01/compute"
-	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2021-08-01/network"
+	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2022-01-01/network"
 	"github.com/Azure/go-autorest/autorest/to"
 
 	v1 "k8s.io/api/core/v1"
@@ -1895,7 +1895,15 @@ func (ss *ScaleSet) ensureBackendPoolDeleted(service *v1.Service, backendPoolID,
 }
 
 // EnsureBackendPoolDeleted ensures the loadBalancer backendAddressPools deleted from the specified nodes.
-func (ss *ScaleSet) EnsureBackendPoolDeleted(service *v1.Service, backendPoolID, vmSetName string, backendAddressPools *[]network.BackendAddressPool, deleteFromVMSet bool) error {
+func (ss *ScaleSet) EnsureBackendPoolDeleted(
+	service *v1.Service,
+	backendPoolID, vmSetName string,
+	backendAddressPools *[]network.BackendAddressPool,
+	deleteFromVMSet, migrateToIPBasedLBBackendPool bool,
+) error {
+	ctx, cancel := getContextWithCancel()
+	defer cancel()
+
 	if backendAddressPools == nil {
 		return nil
 	}
@@ -1940,6 +1948,18 @@ func (ss *ScaleSet) EnsureBackendPoolDeleted(service *v1.Service, backendPoolID,
 		}
 	}
 
+	if migrateToIPBasedLBBackendPool {
+		lbName, err := getLBNameFromBackendPoolID(backendPoolID)
+		if err != nil {
+			return err
+		}
+		backendPoolName, _ := getLBNameFromBackendPoolID(backendPoolID)
+		if rerr := ss.LoadBalancerClient.MigrateToIPBasedBackendPool(ctx, ss.ResourceGroup, lbName, backendPoolName); rerr != nil {
+			klog.Errorf("Failed to migrate to IP based backend pool for lb %s, backend pool %s: %v", lbName, backendPoolName, rerr.Error())
+			return rerr.Error()
+		}
+	}
+
 	if len(vmssUniformBackendIPConfigurations) > 0 {
 		vmssUniformBackendPools := &[]network.BackendAddressPool{
 			{
@@ -1964,7 +1984,7 @@ func (ss *ScaleSet) EnsureBackendPoolDeleted(service *v1.Service, backendPoolID,
 				},
 			},
 		}
-		err := ss.flexScaleSet.EnsureBackendPoolDeleted(service, backendPoolID, vmSetName, vmssFlexBackendPools, deleteFromVMSet)
+		err := ss.flexScaleSet.EnsureBackendPoolDeleted(service, backendPoolID, vmSetName, vmssFlexBackendPools, deleteFromVMSet, migrateToIPBasedLBBackendPool)
 		if err != nil {
 			return err
 		}
@@ -1979,7 +1999,7 @@ func (ss *ScaleSet) EnsureBackendPoolDeleted(service *v1.Service, backendPoolID,
 				},
 			},
 		}
-		err := ss.availabilitySet.EnsureBackendPoolDeleted(service, backendPoolID, vmSetName, avSetBackendPools, deleteFromVMSet)
+		err := ss.availabilitySet.EnsureBackendPoolDeleted(service, backendPoolID, vmSetName, avSetBackendPools, deleteFromVMSet, migrateToIPBasedLBBackendPool)
 		if err != nil {
 			return err
 		}
