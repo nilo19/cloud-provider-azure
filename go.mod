@@ -23,13 +23,13 @@ require (
 	golang.org/x/sync v0.3.0
 	golang.org/x/sys v0.9.0
 	golang.org/x/text v0.10.0
-	k8s.io/api v0.27.2
-	k8s.io/apimachinery v0.27.2
+	k8s.io/api v0.27.3
+	k8s.io/apimachinery v0.27.3
 	k8s.io/apiserver v0.27.2
-	k8s.io/client-go v0.27.2
+	k8s.io/client-go v0.27.3
 	k8s.io/cloud-provider v0.27.2
 	k8s.io/component-base v0.27.2
-	k8s.io/component-helpers v0.27.2
+	k8s.io/component-helpers v0.27.3
 	k8s.io/controller-manager v0.27.2
 	k8s.io/klog/v2 v2.100.1
 	k8s.io/kubelet v0.27.2
