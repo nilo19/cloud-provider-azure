@@ -25,6 +25,7 @@ import (
 	"k8s.io/component-base/config/options"
 	cmconfig "k8s.io/controller-manager/config"
 	migration "k8s.io/controller-manager/pkg/leadermigration/options"
+	"k8s.io/klog/v2"
 )
 
 // GenericControllerManagerConfigurationOptions holds the options which are generic.
@@ -122,11 +123,15 @@ func (o *GenericControllerManagerConfigurationOptions) Validate(allControllers [
 	}
 
 	allControllersSet := sets.NewString(allControllers...)
+	klog.Infof("test: allControllersSet: %v", allControllersSet)
+	klog.Infof("test: controllerAliases: %v", controllerAliases)
 	for _, initialName := range o.Controllers {
+		klog.Infof("test: initialName: %s", initialName)
 		if initialName == "*" {
 			continue
 		}
 		initialNameWithoutPrefix := strings.TrimPrefix(initialName, "-")
+		klog.Infof("test: initialNameWithoutPrefix: %s", initialNameWithoutPrefix)
 		controllerName := initialNameWithoutPrefix
 		if canonicalName, ok := controllerAliases[controllerName]; ok {
 			controllerName = canonicalName
