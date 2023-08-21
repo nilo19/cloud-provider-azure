@@ -434,10 +434,10 @@ var ControllersDisabledByDefault = sets.NewString()
 // paired to their initFunc.  This allows for structured downstream composition and subdivision.
 func newControllerInitializers() map[string]initFunc {
 	controllers := map[string]initFunc{}
-	controllers["cloud-node"] = startCloudNodeController
-	controllers["cloud-node-lifecycle"] = startCloudNodeLifecycleController
-	controllers["service"] = startServiceController
-	controllers["route"] = startRouteController
+	controllers[names.CloudNodeController] = startCloudNodeController
+	controllers[names.CloudNodeLifecycleController] = startCloudNodeLifecycleController
+	controllers[names.ServiceLBController] = startServiceController
+	controllers[names.NodeRouteController] = startRouteController
 	controllers["node-ipam"] = startNodeIpamController
 	return controllers
 }
