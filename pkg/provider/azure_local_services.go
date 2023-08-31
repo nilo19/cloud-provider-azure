@@ -311,7 +311,7 @@ func (az *Cloud) setUpEndpointSlicesInformer(informerFactory informers.SharedInf
 				key := strings.ToLower(fmt.Sprintf("%s/%s", newES.Namespace, svcName))
 				si, found := az.getLocalServiceInfo(key)
 				if !found {
-					klog.V(4).Infof("EndpointSlice %s/%s belongs to service %s, but the service is not a local service, skip updating load balancer backend pool", key, newES.Namespace, newES.Name)
+					klog.V(4).Infof("EndpointSlice %s/%s belongs to service %s, but the service is not a local service, skip updating load balancer backend pool", newES.Namespace, newES.Name, key)
 					return
 				}
 				lbName, ipFamily := si.lbName, si.ipFamily
@@ -471,12 +471,16 @@ func newServiceInfo(ipFamily, lbName string) *serviceInfo {
 
 // getLocalServiceEndpointsNodeNames gets the node names that host all endpoints of the local service.
 func (az *Cloud) getLocalServiceEndpointsNodeNames(service *v1.Service) (sets.Set[string], error) {
-	var ep *discovery_v1.EndpointSlice
+	var (
+		ep           *discovery_v1.EndpointSlice
+		foundInCache bool
+	)
 	az.endpointSlicesCache.Range(func(key, value interface{}) bool {
 		endpointSlice := value.(*discovery_v1.EndpointSlice)
 		if strings.EqualFold(getServiceNameOfEndpointSlice(endpointSlice), service.Name) &&
 			strings.EqualFold(endpointSlice.Namespace, service.Namespace) {
 			ep = endpointSlice
+			foundInCache = true
 			return false
 		}
 		return true
@@ -498,6 +502,9 @@ func (az *Cloud) getLocalServiceEndpointsNodeNames(service *v1.Service) (sets.Se
 	}
 	if ep == nil {
 		return nil, fmt.Errorf("failed to find EndpointSlice for service %s/%s", service.Namespace, service.Name)
+	}
+	if !foundInCache {
+		az.endpointSlicesCache.Store(strings.ToLower(fmt.Sprintf("%s/%s", ep.Namespace, ep.Name)), ep)
 	}
 
 	var nodeNames []string
