@@ -18,6 +18,7 @@ package loadbalancerclient
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -535,6 +536,9 @@ func (c *Client) createOrUpdateLBBackendPool(ctx context.Context, resourceGroupN
 	}
 
 	response, rerr := c.armClient.PutResource(ctx, resourceID, parameters, decorators...)
+	responseBytes, _ := io.ReadAll(response.Body)
+	klog.Infof("test: header: %v", response.Header)
+	klog.Infof("test: body: %s", string(responseBytes))
 	defer c.armClient.CloseResponse(ctx, response)
 	if rerr != nil {
 		klog.V(5).Infof("Received error in %s: resourceID: %s, error: %s", "loadbalancer.backendpool.put.request", resourceID, rerr.Error())
