@@ -105,10 +105,16 @@ if wantLb && az.shouldChangeLoadBalancer(...) {
         }
         if unsafe {
             return ..., fmt.Errorf(
-                "service %q cannot migrate from LB %q: "+
+                "service %q cannot migrate from LB %q to %q: "+
                     "its primary-owned frontend IP configuration %q is referenced by other resources "+
-                    "(load balancing rules, outbound rules, or NAT rules/pools)",
-                getServiceName(service), currLBName, ptr.Deref(fip.Name, ""))
+                    "(load balancing rules, outbound rules, or NAT rules/pools); "+
+                    "to unblock, either remove services sharing this frontend IP, "+
+                    "or adjust LB eligibility to include %q",
+                getServiceName(service),
+                currLBName,
+                expectedLBName,
+                ptr.Deref(fip.Name, ""),
+                currLBName)
         }
     }
     // migration path continues below
@@ -116,6 +122,14 @@ if wantLb && az.shouldChangeLoadBalancer(...) {
 ```
 
 Effect: migration is blocked whenever the service has a primary-owned FIP that is referenced by other resources. Non-shared services pass through freely.
+
+### 3a. Operational Note: Expected "Stuck" Reconcile State
+
+If eligibility rules make `currLBName` ineligible while Change 3 blocks migration (because the primary-owned FIP is shared), reconciliation will repeatedly fail with the same error until operator action is taken.
+
+This is intentional fail-closed behavior to prevent destructive migration of a shared frontend IP. The remediation is:
+- Remove/repoint secondary services sharing the frontend IP, or
+- Adjust LB eligibility so the current host LB remains eligible.
 
 ---
 
@@ -215,7 +229,7 @@ Pseudo-shape:
 fipHostLB := az.findFIPHostingLBName(ctx, service, existingLBs, isInternal)
 scanAllLBs := fipHostLB != ""
 
-for i := range existingLBs {
+for i := len(existingLBs) - 1; i >= 0; i-- {
     // ... status/fip split logic ...
     if migrated {
         if scanAllLBs {
@@ -225,6 +239,10 @@ for i := range existingLBs {
     }
 }
 ```
+
+Why reverse iteration: with `scanAllLBs == true`, the loop may continue after `removeLBFromList(&existingLBs, deletedLBName)`. Reverse indexing avoids stale-index panics and skip-on-shift behavior when the slice shrinks mid-loop.
+
+`scanAllLBs` is computed once before loop entry and remains invariant for that reconciliation pass.
 
 FIP ownership split: at each LB match, call `serviceOwnsFrontendIP` on every FIP returned by `getServiceLoadBalancerStatus`. The `isPrimary` return value (second return; `true` when FIP name starts with service's base LB name) determines the split:
 - `primaryOwnedFIPs`: `isPrimary == true` - name-prefix-owned by this service.
@@ -332,6 +350,12 @@ Why: secondary services that reuse an existing FIP have `fipChanged=false`; we s
 | Primary with `currLB != expectedLB`, `loadBalancerIP` set, FIP referenced by other services' LB rules | returns migration error; no removal performed |
 | Primary with `currLB != expectedLB`, FIP referenced by outbound rule only | returns migration error (outbound rules also trigger unsafe check) |
 | Primary with `currLB != expectedLB`, FIP not referenced | migration proceeds normally |
+| `scanAllLBs=true` and one LB is deleted during loop | no panic; no skipped LB processing |
+
+### `TestChange3BlockedMigrationErrorMessage`
+| Case | Expected |
+|---|---|
+| Primary migration blocked by shared primary-owned FIP | error includes `currLB`, `expectedLB`, and remediation guidance |
 
 ### `TestReconcileLoadBalancerActiveServices` (extend)
 | Case | Expected |
