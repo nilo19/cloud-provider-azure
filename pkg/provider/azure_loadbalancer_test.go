@@ -1972,6 +1972,187 @@ func TestGetServiceLoadBalancerMultiSLB(t *testing.T) {
 	}
 }
 
+func TestGetServiceLoadBalancerMultiSLBSecondarySharingOrderIndependent(t *testing.T) {
+	newLBs := func(lb2First bool) []*armnetwork.LoadBalancer {
+		lb1 := &armnetwork.LoadBalancer{
+			Name: ptr.To("lb1-internal"),
+			Properties: &armnetwork.LoadBalancerPropertiesFormat{
+				FrontendIPConfigurations: []*armnetwork.FrontendIPConfiguration{
+					{
+						Name: ptr.To("atest1"),
+						ID:   ptr.To("lb1-fip-primary"),
+						Properties: &armnetwork.FrontendIPConfigurationPropertiesFormat{
+							PrivateIPAddress: ptr.To("10.0.0.1"),
+						},
+					},
+					{
+						Name: ptr.To("aother"),
+						ID:   ptr.To("lb1-fip-other"),
+						Properties: &armnetwork.FrontendIPConfigurationPropertiesFormat{
+							PrivateIPAddress: ptr.To("10.0.0.9"),
+						},
+					},
+				},
+			},
+		}
+		lb2 := &armnetwork.LoadBalancer{
+			Name: ptr.To("lb2-internal"),
+			Properties: &armnetwork.LoadBalancerPropertiesFormat{
+				FrontendIPConfigurations: []*armnetwork.FrontendIPConfiguration{
+					{
+						Name: ptr.To("primary-owner-fip"),
+						ID:   ptr.To("lb2-fip-shared"),
+						Properties: &armnetwork.FrontendIPConfigurationPropertiesFormat{
+							PrivateIPAddress: ptr.To("10.0.0.5"),
+						},
+					},
+				},
+			},
+		}
+		if lb2First {
+			return []*armnetwork.LoadBalancer{lb2, lb1}
+		}
+		return []*armnetwork.LoadBalancer{lb1, lb2}
+	}
+
+	for _, tc := range []struct {
+		description string
+		existingLBs []*armnetwork.LoadBalancer
+	}{
+		{
+			description: "should handle order [lb2, lb1]",
+			existingLBs: newLBs(true),
+		},
+		{
+			description: "should handle order [lb1, lb2]",
+			existingLBs: newLBs(false),
+		},
+	} {
+		t.Run(tc.description, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+
+			cloud := GetTestCloud(ctrl)
+			cloud.LoadBalancerSKU = consts.LoadBalancerSKUStandard
+			cloud.MultipleStandardLoadBalancerConfigurations = []config.MultipleStandardLoadBalancerConfiguration{
+				{
+					Name: "lb1",
+					MultipleStandardLoadBalancerConfigurationStatus: config.MultipleStandardLoadBalancerConfigurationStatus{
+						ActiveServices: utilsets.NewString("default/test1"),
+					},
+				},
+				{Name: "lb2"},
+			}
+
+			service := getInternalTestService("test1")
+			setServiceLoadBalancerIP(&service, "10.0.0.5")
+
+			lbClient := cloud.NetworkClientFactory.GetLoadBalancerClient().(*mock_loadbalancerclient.MockInterface)
+			lbClient.EXPECT().CreateOrUpdate(gomock.Any(), gomock.Any(), "lb1-internal", gomock.Any()).Return(nil, nil).Times(1)
+
+			mockPLSRepo := cloud.plsRepo.(*privatelinkservice.MockRepository)
+			mockPLSRepo.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+				Return(&armnetwork.PrivateLinkService{ID: to.Ptr(consts.PrivateLinkServiceNotExistID)}, nil).Times(1)
+
+			lb, lbs, _, _, exists, _, err := cloud.getServiceLoadBalancer(
+				context.TODO(),
+				&service,
+				testClusterName,
+				nil,
+				true,
+				tc.existingLBs,
+			)
+			assert.NoError(t, err)
+			assert.True(t, exists)
+			if assert.NotNil(t, lb) {
+				assert.Equal(t, "lb2-internal", ptr.Deref(lb.Name, ""))
+			}
+
+			var (
+				lb1FIPs []string
+				lb2FIPs []string
+			)
+			for _, existingLB := range lbs {
+				switch ptr.Deref(existingLB.Name, "") {
+				case "lb1-internal":
+					for _, fip := range existingLB.Properties.FrontendIPConfigurations {
+						lb1FIPs = append(lb1FIPs, ptr.Deref(fip.Name, ""))
+					}
+				case "lb2-internal":
+					for _, fip := range existingLB.Properties.FrontendIPConfigurations {
+						lb2FIPs = append(lb2FIPs, ptr.Deref(fip.Name, ""))
+					}
+				}
+			}
+
+			assert.NotContains(t, lb1FIPs, "atest1")
+			assert.Contains(t, lb1FIPs, "aother")
+			assert.Contains(t, lb2FIPs, "primary-owner-fip")
+		})
+	}
+}
+
+func TestGetServiceLoadBalancerMultiSLBBlocksMigrationWhenPrimaryFIPShared(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	cloud := GetTestCloud(ctrl)
+	cloud.LoadBalancerSKU = consts.LoadBalancerSKUStandard
+	cloud.MultipleStandardLoadBalancerConfigurations = []config.MultipleStandardLoadBalancerConfiguration{
+		{Name: "lb1"},
+		{
+			Name: "lb2",
+			MultipleStandardLoadBalancerConfigurationStatus: config.MultipleStandardLoadBalancerConfigurationStatus{
+				ActiveServices: utilsets.NewString("default/test1"),
+			},
+		},
+	}
+
+	service := getInternalTestService("test1")
+	existingLBs := []*armnetwork.LoadBalancer{
+		{
+			Name: ptr.To("lb1-internal"),
+			Properties: &armnetwork.LoadBalancerPropertiesFormat{
+				FrontendIPConfigurations: []*armnetwork.FrontendIPConfiguration{
+					{
+						Name: ptr.To("atest1"),
+						ID:   ptr.To("lb1-fip-primary"),
+						Properties: &armnetwork.FrontendIPConfigurationPropertiesFormat{
+							PrivateIPAddress: ptr.To("10.0.0.1"),
+						},
+					},
+				},
+				LoadBalancingRules: []*armnetwork.LoadBalancingRule{
+					{
+						Name: ptr.To("aother-TCP-80"),
+						Properties: &armnetwork.LoadBalancingRulePropertiesFormat{
+							FrontendIPConfiguration: &armnetwork.SubResource{ID: ptr.To("lb1-fip-primary")},
+						},
+					},
+				},
+			},
+		},
+		{
+			Name:       ptr.To("lb2-internal"),
+			Properties: &armnetwork.LoadBalancerPropertiesFormat{},
+		},
+	}
+
+	_, _, _, _, _, _, err := cloud.getServiceLoadBalancer(
+		context.TODO(),
+		&service,
+		testClusterName,
+		nil,
+		true,
+		existingLBs,
+	)
+	if assert.Error(t, err) {
+		assert.Contains(t, err.Error(), `cannot migrate from LB "lb1-internal" to "lb2-internal"`)
+		assert.Contains(t, err.Error(), "to unblock")
+	}
+	assert.Len(t, existingLBs[0].Properties.FrontendIPConfigurations, 1)
+}
+
 func TestGetServiceLoadBalancerCommon(t *testing.T) {
 	testCases := []struct {
 		desc           string
@@ -7951,12 +8132,58 @@ func TestGetEligibleLoadBalancers(t *testing.T) {
 	}
 }
 
-func TestGetAzureLoadBalancerName(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-	az := GetTestCloud(ctrl)
-	az.PrimaryAvailabilitySetName = primary
+func TestHasPinnedFrontendIdentity(t *testing.T) {
+	cases := []struct {
+		description string
+		service     *v1.Service
+		expected    bool
+	}{
+		{
+			description: "service without loadBalancerIP and pip should not be pinned",
+			service:     ptr.To(getTestService("test", v1.ProtocolTCP, nil, false)),
+			expected:    false,
+		},
+		{
+			description: "service with loadBalancerIP annotation should be pinned",
+			service: ptr.To(getTestService("test", v1.ProtocolTCP, map[string]string{
+				consts.ServiceAnnotationLoadBalancerIPDualStack[false]: "10.0.0.5",
+			}, false)),
+			expected: true,
+		},
+		{
+			description: "service with pip annotation should be pinned",
+			service: ptr.To(getTestService("test", v1.ProtocolTCP, map[string]string{
+				consts.ServiceAnnotationPIPNameDualStack[false]: "pip-v4",
+			}, false)),
+			expected: true,
+		},
+		{
+			description: "service with empty pip annotations should not be pinned",
+			service: ptr.To(getTestService("test", v1.ProtocolTCP, map[string]string{
+				consts.ServiceAnnotationPIPNameDualStack[false]: "",
+				consts.ServiceAnnotationPIPNameDualStack[true]:  "",
+			}, false)),
+			expected: false,
+		},
+		{
+			description: "primary service with spec.loadBalancerIP should be pinned",
+			service: func() *v1.Service {
+				svc := getTestService("test", v1.ProtocolTCP, nil, false)
+				svc.Spec.LoadBalancerIP = "10.0.0.6"
+				return &svc
+			}(),
+			expected: true,
+		},
+	}
 
+	for _, tc := range cases {
+		t.Run(tc.description, func(t *testing.T) {
+			assert.Equal(t, tc.expected, hasPinnedFrontendIdentity(tc.service))
+		})
+	}
+}
+
+func TestGetAzureLoadBalancerName(t *testing.T) {
 	cases := []struct {
 		description       string
 		vmSet             string
@@ -7967,6 +8194,7 @@ func TestGetAzureLoadBalancerName(t *testing.T) {
 		multiSLBConfigs   []config.MultipleStandardLoadBalancerConfiguration
 		serviceAnnotation map[string]string
 		serviceLabel      map[string]string
+		existingLBs       []*armnetwork.LoadBalancer
 		expected          string
 		expectedErr       error
 	}{
@@ -8090,30 +8318,131 @@ func TestGetAzureLoadBalancerName(t *testing.T) {
 			},
 			expectedErr: errors.New(`service "default/test" selects 1 load balancers (a), but 0 of them () have AllowServicePlacement set to false and the service is not using any of them, 1 of them (a) do not match the service label selector, and 0 of them () do not match the service namespace selector`),
 		},
+		{
+			description:   "should reject pinned service that also sets load balancer configurations",
+			vmSet:         primary,
+			useStandardLB: true,
+			isInternal:    true,
+			multiSLBConfigs: []config.MultipleStandardLoadBalancerConfiguration{
+				{Name: "lb1"},
+			},
+			serviceAnnotation: map[string]string{
+				consts.ServiceAnnotationLoadBalancerInternal:           consts.TrueAnnotationValue,
+				consts.ServiceAnnotationLoadBalancerIPDualStack[false]: "10.0.0.5",
+				consts.ServiceAnnotationLoadBalancerConfigurations:     "lb1",
+			},
+			expectedErr: errors.New(`service "default/test" sets "service.beta.kubernetes.io/azure-load-balancer-configurations" while also pinning a target IP/PIP; remove the load balancer configuration annotation and let the controller select the LB that hosts the target frontend IP`),
+		},
+		{
+			description:   "should choose host LB for secondary sharing even with case mismatch",
+			vmSet:         primary,
+			useStandardLB: true,
+			isInternal:    true,
+			multiSLBConfigs: []config.MultipleStandardLoadBalancerConfiguration{
+				{
+					Name: "lb1",
+					MultipleStandardLoadBalancerConfigurationStatus: config.MultipleStandardLoadBalancerConfigurationStatus{
+						ActiveServices: utilsets.NewString("default/test"),
+					},
+				},
+				{Name: "LB2"},
+			},
+			serviceAnnotation: map[string]string{
+				consts.ServiceAnnotationLoadBalancerInternal:           consts.TrueAnnotationValue,
+				consts.ServiceAnnotationLoadBalancerIPDualStack[false]: "10.0.0.5",
+			},
+			existingLBs: []*armnetwork.LoadBalancer{
+				{
+					Name: ptr.To("lb1-internal"),
+					Properties: &armnetwork.LoadBalancerPropertiesFormat{
+						FrontendIPConfigurations: []*armnetwork.FrontendIPConfiguration{
+							{
+								Name: ptr.To("atest"),
+								Properties: &armnetwork.FrontendIPConfigurationPropertiesFormat{
+									PrivateIPAddress: ptr.To("10.0.0.1"),
+								},
+							},
+						},
+					},
+				},
+				{
+					Name: ptr.To("lb2-internal"),
+					Properties: &armnetwork.LoadBalancerPropertiesFormat{
+						FrontendIPConfigurations: []*armnetwork.FrontendIPConfiguration{
+							{
+								Name: ptr.To("primary-owner-fip"),
+								Properties: &armnetwork.FrontendIPConfigurationPropertiesFormat{
+									PrivateIPAddress: ptr.To("10.0.0.5"),
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: "LB2-internal",
+		},
+		{
+			description:   "should return an error when host LB is not eligible",
+			vmSet:         primary,
+			useStandardLB: true,
+			isInternal:    true,
+			multiSLBConfigs: []config.MultipleStandardLoadBalancerConfiguration{
+				{
+					Name: "lb1",
+					MultipleStandardLoadBalancerConfigurationStatus: config.MultipleStandardLoadBalancerConfigurationStatus{
+						ActiveServices: utilsets.NewString("default/test"),
+					},
+				},
+			},
+			serviceAnnotation: map[string]string{
+				consts.ServiceAnnotationLoadBalancerInternal:           consts.TrueAnnotationValue,
+				consts.ServiceAnnotationLoadBalancerIPDualStack[false]: "10.0.0.5",
+			},
+			existingLBs: []*armnetwork.LoadBalancer{
+				{
+					Name: ptr.To("lb2-internal"),
+					Properties: &armnetwork.LoadBalancerPropertiesFormat{
+						FrontendIPConfigurations: []*armnetwork.FrontendIPConfiguration{
+							{
+								Name: ptr.To("primary-owner-fip"),
+								Properties: &armnetwork.FrontendIPConfigurationPropertiesFormat{
+									PrivateIPAddress: ptr.To("10.0.0.5"),
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedErr: errors.New(`service "default/test" targets a frontend IP on LB "lb2" which is not in the eligible set [lb1]; adjust the LB eligibility configuration to include it`),
+		},
 	}
 
 	for _, c := range cases {
 		t.Run(c.description, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+			az := GetTestCloud(ctrl)
+			az.PrimaryAvailabilitySetName = primary
+
 			if c.useStandardLB {
 				az.LoadBalancerSKU = consts.LoadBalancerSKUStandard
 			} else {
 				az.LoadBalancerSKU = consts.LoadBalancerSKUBasic
 			}
 
-			if len(c.multiSLBConfigs) > 0 {
-				az.MultipleStandardLoadBalancerConfigurations = c.multiSLBConfigs
-			}
-
+			az.MultipleStandardLoadBalancerConfigurations = c.multiSLBConfigs
 			az.LoadBalancerName = c.lbName
 			svc := getTestService("test", v1.ProtocolTCP, c.serviceAnnotation, false)
 			if c.serviceLabel != nil {
 				svc.Labels = c.serviceLabel
 			}
-			loadbalancerName, err := az.getAzureLoadBalancerName(context.TODO(), &svc, []*armnetwork.LoadBalancer{}, c.clusterName, c.vmSet, c.isInternal)
-			assert.Equal(t, c.expected, loadbalancerName)
+			loadbalancerName, err := az.getAzureLoadBalancerName(context.TODO(), &svc, c.existingLBs, c.clusterName, c.vmSet, c.isInternal)
 			if c.expectedErr != nil {
 				assert.EqualError(t, err, c.expectedErr.Error())
+				return
 			}
+			assert.NoError(t, err)
+			assert.Equal(t, c.expected, loadbalancerName)
 		})
 	}
 }

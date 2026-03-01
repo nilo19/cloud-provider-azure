@@ -808,9 +808,23 @@ func (az *Cloud) getServiceLoadBalancer(
 	}
 
 	// check if the service already has a load balancer
-	var shouldChangeLB bool
-	for i := range existingLBs {
-		existingLB := (existingLBs)[i]
+	var (
+		shouldChangeLB            bool
+		selectedDefaultLB         *armnetwork.LoadBalancer
+		selectedDefaultLBStatus   *v1.LoadBalancerStatus
+		selectedDefaultLBIngress  []string
+		scanAllLBsForMigrationFix bool
+	)
+	if wantLb && az.UseMultipleStandardLoadBalancers() {
+		scanAllLBsForMigrationFix = az.findFIPHostingLBName(ctx, service, existingLBs, isInternal) != ""
+	}
+
+	loopStart, loopEnd, step := 0, len(existingLBs), 1
+	if scanAllLBsForMigrationFix {
+		loopStart, loopEnd, step = len(existingLBs)-1, -1, -1
+	}
+	for i := loopStart; i != loopEnd; i += step {
+		existingLB := existingLBs[i]
 
 		if strings.EqualFold(*existingLB.Name, defaultLBName) {
 			defaultLB = existingLB
@@ -835,6 +849,11 @@ func (az *Cloud) getServiceLoadBalancer(
 			"wantLB", wantLb,
 			"currentLBIPs", lbIPsPrimaryPIPs,
 		)
+		if scanAllLBsForMigrationFix && strings.EqualFold(ptr.Deref(existingLB.Name, ""), defaultLBName) {
+			selectedDefaultLB = existingLB
+			selectedDefaultLBStatus = status
+			selectedDefaultLBIngress = lbIPsPrimaryPIPs
+		}
 
 		// select another load balancer instead of returning
 		// the current one if the change is needed
@@ -844,50 +863,90 @@ func (az *Cloud) getServiceLoadBalancer(
 		)
 		if wantLb && az.shouldChangeLoadBalancer(service, ptr.Deref(existingLB.Name, ""), clusterName, defaultLBName) {
 			shouldChangeLB = true
-			fipConfigNames := []string{}
+
+			primaryOwnedFIPConfigs := []*armnetwork.FrontendIPConfiguration{}
 			for _, fipConfig := range fipConfigs {
-				fipConfigNames = append(fipConfigNames, ptr.Deref(fipConfig.Name, ""))
-			}
-			deletedLBName, deletedPLS, err = az.removeFrontendIPConfigurationFromLoadBalancer(ctx, existingLB, existingLBs, fipConfigs, clusterName, service)
-			if err != nil {
-				logger.Error(err, "failed to remove frontend IP configurations from load balancer", "service", service.Name, "clusterName", clusterName, "wantLb", wantLb, "fipConfigNames", fipConfigNames)
-				return nil, nil, nil, nil, false, false, err
-			}
-			if deletedPLS {
-				return nil, nil, nil, nil, false, true, nil
-			}
-			if deletedLBName != "" {
-				removeLBFromList(&existingLBs, deletedLBName)
-			}
-			az.reconcileMultipleStandardLoadBalancerConfigurationStatus(
-				false,
-				getServiceName(service),
-				ptr.Deref(existingLB.Name, ""),
-			)
-
-			if isLocalService(service) && az.UseMultipleStandardLoadBalancers() {
-				// No need for the endpoint slice informer to update the backend pool
-				// for the service because the main loop will delete the old backend pool
-				// and create a new one in the new load balancer.
-				svcName := getServiceName(service)
-				if az.backendPoolUpdater != nil {
-					az.backendPoolUpdater.removeOperation(svcName)
+				owns, isPrimaryService, _ := az.serviceOwnsFrontendIP(ctx, fipConfig, service)
+				if owns && isPrimaryService {
+					primaryOwnedFIPConfigs = append(primaryOwnedFIPConfigs, fipConfig)
 				}
+			}
 
-				// Remove backend pools on the previous load balancer for the local service
-				if deletedLBName == "" {
-					newLBs, err := az.cleanupLocalServiceBackendPool(ctx, service, nodes, existingLBs, clusterName)
-					if err != nil {
-						logger.Error(err, "failed to cleanup backend pool for local service", "service", service.Name, "clusterName", clusterName, "wantLb", wantLb)
-						return nil, nil, nil, nil, false, false, err
+			for _, fipConfig := range primaryOwnedFIPConfigs {
+				unsafe, err := az.isFrontendIPConfigUnsafeToDelete(existingLB, service, fipConfig.ID)
+				if err != nil {
+					return nil, nil, nil, nil, false, false, err
+				}
+				if unsafe {
+					currLBName := ptr.Deref(existingLB.Name, "")
+					return nil, nil, nil, nil, false, false, fmt.Errorf(
+						"service %q cannot migrate from LB %q to %q: its primary-owned frontend IP configuration %q is referenced by other resources (load balancing rules, outbound rules, or NAT rules/pools); to unblock, either remove services sharing this frontend IP, or adjust LB eligibility to include %q",
+						getServiceName(service),
+						currLBName,
+						defaultLBName,
+						ptr.Deref(fipConfig.Name, ""),
+						currLBName,
+					)
+				}
+			}
+
+			if len(primaryOwnedFIPConfigs) > 0 {
+				fipConfigNames := []string{}
+				for _, fipConfig := range primaryOwnedFIPConfigs {
+					fipConfigNames = append(fipConfigNames, ptr.Deref(fipConfig.Name, ""))
+				}
+				deletedLBName, deletedPLS, err = az.removeFrontendIPConfigurationFromLoadBalancer(ctx, existingLB, existingLBs, primaryOwnedFIPConfigs, clusterName, service)
+				if err != nil {
+					logger.Error(err, "failed to remove frontend IP configurations from load balancer", "service", service.Name, "clusterName", clusterName, "wantLb", wantLb, "fipConfigNames", fipConfigNames)
+					return nil, nil, nil, nil, false, false, err
+				}
+				if deletedPLS {
+					return nil, nil, nil, nil, false, true, nil
+				}
+				if deletedLBName != "" {
+					removeLBFromList(&existingLBs, deletedLBName)
+				}
+				az.reconcileMultipleStandardLoadBalancerConfigurationStatus(
+					false,
+					getServiceName(service),
+					ptr.Deref(existingLB.Name, ""),
+				)
+
+				if isLocalService(service) && az.UseMultipleStandardLoadBalancers() {
+					// No need for the endpoint slice informer to update the backend pool
+					// for the service because the main loop will delete the old backend pool
+					// and create a new one in the new load balancer.
+					svcName := getServiceName(service)
+					if az.backendPoolUpdater != nil {
+						az.backendPoolUpdater.removeOperation(svcName)
 					}
-					existingLBs = newLBs
+
+					// Remove backend pools on the previous load balancer for the local service
+					if deletedLBName == "" {
+						newLBs, err := az.cleanupLocalServiceBackendPool(ctx, service, nodes, existingLBs, clusterName)
+						if err != nil {
+							logger.Error(err, "failed to cleanup backend pool for local service", "service", service.Name, "clusterName", clusterName, "wantLb", wantLb)
+							return nil, nil, nil, nil, false, false, err
+						}
+						existingLBs = newLBs
+					}
 				}
+			}
+
+			if scanAllLBsForMigrationFix {
+				continue
 			}
 			break
 		}
 
+		if scanAllLBsForMigrationFix {
+			continue
+		}
+
 		return existingLB, existingLBs, status, lbIPsPrimaryPIPs, true, false, nil
+	}
+	if selectedDefaultLB != nil {
+		return selectedDefaultLB, existingLBs, selectedDefaultLBStatus, selectedDefaultLBIngress, true, false, nil
 	}
 
 	// Service does not have a load balancer, select one.
@@ -2074,7 +2133,7 @@ func (az *Cloud) reconcileLoadBalancer(ctx context.Context, clusterName string, 
 		}
 	}
 
-	if fipChanged {
+	if fipChanged || az.UseMultipleStandardLoadBalancers() {
 		az.reconcileMultipleStandardLoadBalancerConfigurationStatus(wantLb, serviceName, lbName)
 	}
 
@@ -4107,12 +4166,36 @@ func (az *Cloud) getAzureLoadBalancerName(
 	// 1. Filter out the eligible load balancers.
 	// 2. Choose the most eligible load balancer.
 	if az.UseMultipleStandardLoadBalancers() {
+		if hasPinnedFrontendIdentity(service) && len(consts.GetLoadBalancerConfigurationsNames(service)) > 0 {
+			return "", fmt.Errorf(
+				"service %q sets %q while also pinning a target IP/PIP; remove the load balancer configuration annotation and let the controller select the LB that hosts the target frontend IP",
+				getServiceName(service),
+				consts.ServiceAnnotationLoadBalancerConfigurations,
+			)
+		}
+
 		eligibleLBs, err := az.getEligibleLoadBalancersForService(ctx, service)
 		if err != nil {
 			return "", err
 		}
 
 		currentLBName := az.getServiceCurrentLoadBalancerName(service)
+		if fipHostLBName := az.findFIPHostingLBName(ctx, service, existingLBs, isInternal); fipHostLBName != "" {
+			if !stringInSliceFold(fipHostLBName, eligibleLBs) {
+				return "", fmt.Errorf(
+					"service %q targets a frontend IP on LB %q which is not in the eligible set %v; adjust the LB eligibility configuration to include it",
+					getServiceName(service),
+					fipHostLBName,
+					eligibleLBs,
+				)
+			}
+			for _, eligibleLBName := range eligibleLBs {
+				if strings.EqualFold(eligibleLBName, fipHostLBName) {
+					currentLBName = eligibleLBName
+					break
+				}
+			}
+		}
 		lbNamePrefix = getMostEligibleLBForService(currentLBName, eligibleLBs, existingLBs, requiresInternalLoadBalancer(service))
 	}
 
@@ -4120,6 +4203,61 @@ func (az *Cloud) getAzureLoadBalancerName(
 		return fmt.Sprintf("%s%s", lbNamePrefix, consts.InternalLoadBalancerNameSuffix), nil
 	}
 	return lbNamePrefix, nil
+}
+
+// hasPinnedFrontendIdentity returns true when the service explicitly pins
+// frontend identity via loadBalancerIP/PIP annotations or spec.loadBalancerIP.
+func hasPinnedFrontendIdentity(service *v1.Service) bool {
+	if len(getServiceLoadBalancerIPs(service)) > 0 {
+		return true
+	}
+
+	for _, pipName := range getServicePIPNames(service) {
+		if pipName != "" {
+			return true
+		}
+	}
+
+	return false
+}
+
+// findFIPHostingLBName returns the name of the LB that hosts a FIP matching
+// the service's pinned target IP/PIP. Returns "" if no match is found.
+func (az *Cloud) findFIPHostingLBName(
+	ctx context.Context,
+	service *v1.Service,
+	existingLBs []*armnetwork.LoadBalancer,
+	isInternal bool,
+) string {
+	if !hasPinnedFrontendIdentity(service) {
+		return ""
+	}
+
+	for _, lb := range existingLBs {
+		if isInternalLoadBalancer(lb) != isInternal {
+			continue
+		}
+		if lb.Properties == nil || lb.Properties.FrontendIPConfigurations == nil {
+			continue
+		}
+		for _, fipConfig := range lb.Properties.FrontendIPConfigurations {
+			owns, isPrimaryService, _ := az.serviceOwnsFrontendIP(ctx, fipConfig, service)
+			if owns && !isPrimaryService {
+				return trimSuffixIgnoreCase(ptr.Deref(lb.Name, ""), consts.InternalLoadBalancerNameSuffix)
+			}
+		}
+	}
+
+	return ""
+}
+
+func stringInSliceFold(s string, list []string) bool {
+	for _, item := range list {
+		if strings.EqualFold(s, item) {
+			return true
+		}
+	}
+	return false
 }
 
 func getMostEligibleLBForService(
