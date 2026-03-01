@@ -581,12 +581,16 @@ func (az *Cloud) removeFrontendIPConfigurationFromLoadBalancer(ctx context.Conte
 		return "", false, nil
 	}
 	fipConfigs := lb.Properties.FrontendIPConfigurations
-	for i, fipConfig := range fipConfigs {
-		for _, fip := range fips {
-			if strings.EqualFold(ptr.Deref(fipConfig.Name, ""), ptr.Deref(fip.Name, "")) {
-				fipConfigs = append(fipConfigs[:i], fipConfigs[i+1:]...)
-				break
-			}
+	fipNamesToDelete := utilsets.NewString()
+	for _, fip := range fips {
+		fipName := ptr.Deref(fip.Name, "")
+		if fipName != "" {
+			fipNamesToDelete.Insert(strings.ToLower(fipName))
+		}
+	}
+	for i := len(fipConfigs) - 1; i >= 0; i-- {
+		if fipNamesToDelete.Has(strings.ToLower(ptr.Deref(fipConfigs[i].Name, ""))) {
+			fipConfigs = append(fipConfigs[:i], fipConfigs[i+1:]...)
 		}
 	}
 	lb.Properties.FrontendIPConfigurations = fipConfigs
@@ -792,11 +796,6 @@ func (az *Cloud) getServiceLoadBalancer(
 
 	isInternal := requiresInternalLoadBalancer(service)
 	var defaultLB *armnetwork.LoadBalancer
-	primaryVMSetName := az.VMSet.GetPrimaryVMSetName()
-	defaultLBName, err := az.getAzureLoadBalancerName(ctx, service, existingLBs, clusterName, primaryVMSetName, isInternal)
-	if err != nil {
-		return nil, nil, nil, nil, false, false, err
-	}
 
 	// reuse the lb list from reconcileSharedLoadBalancer to reduce the api call
 	if len(existingLBs) == 0 {
@@ -805,6 +804,16 @@ func (az *Cloud) getServiceLoadBalancer(
 			return nil, nil, nil, nil, false, false, err
 		}
 		existingLBs = lbs
+	}
+	fipHostingLBName := ""
+	if wantLb && az.UseMultipleStandardLoadBalancers() {
+		fipHostingLBName = az.findFIPHostingLBName(ctx, service, existingLBs, isInternal)
+	}
+
+	primaryVMSetName := az.VMSet.GetPrimaryVMSetName()
+	defaultLBName, err := az.getAzureLoadBalancerNameWithHints(ctx, service, existingLBs, clusterName, primaryVMSetName, isInternal, fipHostingLBName)
+	if err != nil {
+		return nil, nil, nil, nil, false, false, err
 	}
 
 	// check if the service already has a load balancer
@@ -816,7 +825,7 @@ func (az *Cloud) getServiceLoadBalancer(
 		scanAllLBsForMigrationFix bool
 	)
 	if wantLb && az.UseMultipleStandardLoadBalancers() {
-		scanAllLBsForMigrationFix = az.findFIPHostingLBName(ctx, service, existingLBs, isInternal) != ""
+		scanAllLBsForMigrationFix = fipHostingLBName != ""
 	}
 
 	loopStart, loopEnd, step := 0, len(existingLBs), 1
@@ -4151,6 +4160,17 @@ func (az *Cloud) getAzureLoadBalancerName(
 	clusterName, vmSetName string,
 	isInternal bool,
 ) (string, error) {
+	return az.getAzureLoadBalancerNameWithHints(ctx, service, existingLBs, clusterName, vmSetName, isInternal, "")
+}
+
+func (az *Cloud) getAzureLoadBalancerNameWithHints(
+	ctx context.Context,
+	service *v1.Service,
+	existingLBs []*armnetwork.LoadBalancer,
+	clusterName, vmSetName string,
+	isInternal bool,
+	fipHostLBNameHint string,
+) (string, error) {
 	if az.LoadBalancerName != "" {
 		clusterName = az.LoadBalancerName
 	}
@@ -4180,7 +4200,11 @@ func (az *Cloud) getAzureLoadBalancerName(
 		}
 
 		currentLBName := az.getServiceCurrentLoadBalancerName(service)
-		if fipHostLBName := az.findFIPHostingLBName(ctx, service, existingLBs, isInternal); fipHostLBName != "" {
+		fipHostLBName := fipHostLBNameHint
+		if fipHostLBName == "" {
+			fipHostLBName = az.findFIPHostingLBName(ctx, service, existingLBs, isInternal)
+		}
+		if fipHostLBName != "" {
 			if !stringInSliceFold(fipHostLBName, eligibleLBs) {
 				return "", fmt.Errorf(
 					"service %q targets a frontend IP on LB %q which is not in the eligible set %v; adjust the LB eligibility configuration to include it",
